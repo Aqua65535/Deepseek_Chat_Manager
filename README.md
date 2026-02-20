@@ -37,7 +37,7 @@
 
 ### 前置条件
 1. 安装 [Tampermonkey](https://www.tampermonkey.net/) 浏览器扩展，按照官网的提示完成相关配置操作；
-2. 点击此处下载脚本源代码文件：[DeepSeek对话管理器1.1.0.js]([你的脚本发布链接](https://github.com/Aqua65535/Deepseek_Chat_Manager/releases/download/v1.1.0/DeepSeek_Chat_Manager.js))；
+2. 点击此处下载脚本源代码文件：[DeepSeek对话管理器1.1.0.js](https://github.com/Aqua65535/Deepseek_Chat_Manager/releases/download/v1.1.0/DeepSeek_Chat_Manager.js)；
 3. 创建新脚本，把源代码复制粘贴进去；
 4. 打开 https://chat.deepseek.com/ ，如果能看到右下角的3个圆形按钮，就说明安装成功了！
 
@@ -109,4 +109,5 @@ A：看心情，看 PR，看哪天我 JS 水平突飞猛进（）。
 ## 📄 许可证
 
 [MIT License](https://opensource.org/licenses/MIT) © 2026 Aqua_65535
+
 
