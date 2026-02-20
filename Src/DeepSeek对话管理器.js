@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         DeepSeek对话管理器
 // @namespace    http://tampermonkey.net/
-// @version      1.0.0
+// @version      1.1.0
 // @description  基于berry22jelly的"DeepSeek对话收藏器(v1.0.1)"改造的脚本，支持收藏、搜索、分类DeepSeek对话
 // @author       Aqua_65535
 // @license      MIT
@@ -16,25 +16,10 @@
 // @grant        GM_addStyle
 // ==/UserScript==
 
-/*
-原脚本：DeepSeek对话收藏器 (v1.0.1) by berry22jelly
-原脚本地址：http://greasyfork.icu/zh-CN/scripts/548318-deepseek对话收藏器
-
-修改说明：
-1. 在原脚本基础上增加了分类管理功能
-2. 重构了UI界面，支持深浅主题
-3. 增加了批量操作、排序、搜索等功能
-4. 优化了代码结构和性能
-
-本修改版本遵循原脚本的MIT许可证，欢迎自由使用和修改。
-*/
-
-//感谢原作者berry22jelly！(´▽`ʃ♡ƪ)
-
 (function() {
     'use strict';
 
-    console.log('DeepSeek收藏器脚本 v1.0.0 已加载！');
+    console.log('DeepSeek收藏器脚本 v1.1.0 已加载！');
 
     // 使用GM存储函数进行数据持久化
     const storage = {
@@ -54,7 +39,11 @@
                 return [];
             }
         },
-        remove: (key) => GM_deleteValue(key)
+        remove: (key) => GM_deleteValue(key),
+        getLastBackupTime: () => GM_getValue('dsc_last_backup_time', 0),
+        setLastBackupTime: (time) => GM_setValue('dsc_last_backup_time', time),
+        getBackupReminderDisabled: () => GM_getValue('dsc_backup_reminder_disabled', false),
+        setBackupReminderDisabled: (disabled) => GM_setValue('dsc_backup_reminder_disabled', disabled)
     };
 
     // 主色调
@@ -72,18 +61,14 @@
 
     // 分类管理 - 固定6个，仅支持重命名
     const categories = {
-        // 存储分类名称的键名
         STORAGE_KEY: 'dsc_fixed_categories',
 
-        // 获取所有分类（始终返回6个）
         getAll: () => {
             try {
                 const saved = storage.get(categories.STORAGE_KEY, []);
-                // 确保始终返回6个分类
                 if (Array.isArray(saved) && saved.length === 6) {
                     return saved;
                 } else {
-                    // 如果保存的不是6个或不存在，则初始化为默认值
                     categories.save(FIXED_CATEGORIES);
                     return [...FIXED_CATEGORIES];
                 }
@@ -93,12 +78,9 @@
             }
         },
 
-        // 保存分类（始终保存6个）
         save: (cats) => {
             try {
-                // 强制确保只有6个
                 const catsToSave = Array.isArray(cats) ? cats.slice(0, 6) : [...FIXED_CATEGORIES];
-                // 如果不足6个，用默认值补全
                 while (catsToSave.length < 6) {
                     catsToSave.push(FIXED_CATEGORIES[catsToSave.length]);
                 }
@@ -109,14 +91,12 @@
             }
         },
 
-        // 重命名分类
         rename: (index, newName) => {
             try {
                 const cats = categories.getAll();
                 const trimmedName = newName.trim();
                 if (!trimmedName) return false;
 
-                // 检查是否与其他分类重名（除了自己）
                 if (cats.some((name, i) => i !== index && name === trimmedName)) {
                     return false;
                 }
@@ -131,24 +111,49 @@
             }
         },
 
-        // 获取分类对应的索引
         getIndex: (categoryName) => {
             const cats = categories.getAll();
             return cats.indexOf(categoryName);
         }
     };
 
-    // 计算对话长度
+    // 缓存变量
+    let collectionListCache = null;
+    let categoriesListCache = null;
+    let batchToolbarCache = null;
+    let selectAllCheckboxCache = null;
+    let selectedCountSpanCache = null;
+    let searchInputCache = null;
+    let sortSelectCache = null;
+
+    function resetCaches() {
+        collectionListCache = null;
+        categoriesListCache = null;
+        batchToolbarCache = null;
+        selectAllCheckboxCache = null;
+        selectedCountSpanCache = null;
+        searchInputCache = null;
+        sortSelectCache = null;
+        console.log('缓存已重置');
+    }
+
     const getContentLength = (content) => content ? content.length : 0;
 
-    // 获取标题首字母
     const getTitleFirstLetter = (title) => {
         if (!title) return '#';
         const firstChar = title.charAt(0);
         return /[a-zA-Z]/.test(firstChar) ? firstChar.toUpperCase() : '#';
     };
 
-    // 排序函数
+    function isGhostItem(value) {
+        const isEmptyTitle = !value.title || value.title.trim() === '' ||
+                            value.title === '---';
+        const isEmptyContent = !value.content || value.content.trim() === '' ||
+                              value.content === '-----' ||
+                              value.content.length === 0;
+        return isEmptyTitle && isEmptyContent;
+    }
+
     const sortCollections = (collections, sortBy) => {
         return [...collections].sort((a, b) => {
             try {
@@ -175,7 +180,6 @@
         });
     };
 
-    // 检查是否是同一个对话（使用哈希）
     function isSameConversation(conv1, conv2) {
         try {
             const hash1 = hashCode(conv1.title + conv1.content);
@@ -186,7 +190,6 @@
         }
     }
 
-    // 工具函数：生成内容哈希
     function hashCode(str) {
         let hash = 0;
         for (let i = 0; i < str.length; i++) {
@@ -197,161 +200,141 @@
         return hash;
     }
 
-// 获取当前对话内容
-// 获取当前对话内容
-function getCurrentConversation() {
-    try {
-        const messages = [];
+    function getCurrentConversation() {
+        try {
+            const messages = [];
 
-        // DeepSeek特定的选择器
-        const selectors = [
-            '.ds-markdown',
-            '[class*="message-content"]',
-            '[class*="chat-message"]',
-            '.f6ed5067',
-            '[data-testid="message"]'
-        ];
+            const selectors = [
+                '.ds-markdown',
+                '[class*="message-content"]',
+                '[class*="chat-message"]',
+                '.f6ed5067',
+                '[data-testid="message"]'
+            ];
 
-        for (const selector of selectors) {
-            const elements = document.querySelectorAll(selector);
-            if (elements.length > 0) {
-                elements.forEach(el => {
-                    if (!el.closest('button') && !el.closest('input') && !el.closest('textarea')) {
-                        // 克隆节点，避免修改原始DOM
-                        const clone = el.cloneNode(true);
+            for (const selector of selectors) {
+                const elements = document.querySelectorAll(selector);
+                if (elements.length > 0) {
+                    elements.forEach(el => {
+                        if (!el.closest('button') && !el.closest('input') && !el.closest('textarea')) {
+                            const clone = el.cloneNode(true);
 
-                        // 处理代码块 - 替换为 [代码块] 标记
-                        const codeBlocks = clone.querySelectorAll('pre, code, .hljs, [class*="code-block"]');
-                        codeBlocks.forEach(block => {
-                            const placeholder = document.createElement('span');
-                            placeholder.textContent = '[代码块]';
-                            block.parentNode.replaceChild(placeholder, block);
-                        });
-
-                        // 处理LaTeX公式 - 替换为 [LaTeX] 标记
-                        // DeepSeek可能使用的LaTeX相关选择器
-                        const latexSelectors = [
-                            '.katex',  // KaTeX渲染的公式
-                            '.katex-display', // 行间公式
-                            '.katex-inline', // 行内公式
-                            '[class*="math"]', // 包含math的类名
-                            '.MathJax', // MathJax渲染的公式
-                            'span[data-formula]', // 可能的数据属性
-                            'code.language-latex', // LaTeX代码块
-                            '[class*="latex"]' // 包含latex的类名
-                        ];
-
-                        for (const latexSelector of latexSelectors) {
-                            const latexElements = clone.querySelectorAll(latexSelector);
-                            latexElements.forEach(latexEl => {
+                            const codeBlocks = clone.querySelectorAll('pre, code, .hljs, [class*="code-block"]');
+                            codeBlocks.forEach(block => {
                                 const placeholder = document.createElement('span');
-                                placeholder.textContent = '[LaTeX]';
-                                latexEl.parentNode.replaceChild(placeholder, latexEl);
+                                placeholder.textContent = '[代码块]';
+                                block.parentNode.replaceChild(placeholder, block);
                             });
-                        }
 
-                        // 另外处理常见的LaTeX模式：$...$ 和 $$...$$
-                        // 但注意不要重复处理已经被替换的元素
-                        const textNodes = [];
-                        const walk = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT, null, false);
-                        let node;
-                        while (node = walk.nextNode()) {
-                            textNodes.push(node);
-                        }
+                            const latexSelectors = [
+                                '.katex', '.katex-display', '.katex-inline',
+                                '[class*="math"]', '.MathJax', 'span[data-formula]',
+                                'code.language-latex', '[class*="latex"]'
+                            ];
 
-                        textNodes.forEach(textNode => {
-                            const text = textNode.textContent;
-                            // 检查是否包含LaTeX标记（$...$ 或 $$...$$）
-                            if (text && (text.includes('$$') || (text.includes('$') && !text.includes('[$]')))) {
-                                // 简单的正则匹配，实际可能更复杂，这里仅作示例
-                                const hasLatex = /\$\$[^$]+\$\$|\$[^$]+\$/.test(text);
-                                if (hasLatex) {
-                                    // 将包含LaTeX的文本节点替换为标记
+                            for (const latexSelector of latexSelectors) {
+                                const latexElements = clone.querySelectorAll(latexSelector);
+                                latexElements.forEach(latexEl => {
                                     const placeholder = document.createElement('span');
                                     placeholder.textContent = '[LaTeX]';
-                                    textNode.parentNode.replaceChild(placeholder, textNode);
-                                }
+                                    latexEl.parentNode.replaceChild(placeholder, latexEl);
+                                });
                             }
-                        });
 
-                        // 获取处理后的文本
-                        const text = clone.textContent.trim();
-                        if (text && text.length > 5) {
-                            messages.push(text);
+                            const textNodes = [];
+                            const walk = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT, null, false);
+                            let node;
+                            while (node = walk.nextNode()) {
+                                textNodes.push(node);
+                            }
+
+                            textNodes.forEach(textNode => {
+                                const text = textNode.textContent;
+                                if (text && (text.includes('$$') || (text.includes('$') && !text.includes('[$]')))) {
+                                    const hasLatex = /\$\$[^$]+\$\$|\$[^$]+\$/.test(text);
+                                    if (hasLatex) {
+                                        const placeholder = document.createElement('span');
+                                        placeholder.textContent = '[LaTeX]';
+                                        textNode.parentNode.replaceChild(placeholder, textNode);
+                                    }
+                                }
+                            });
+
+                            const text = clone.textContent.trim();
+                            if (text && text.length > 5) {
+                                messages.push(text);
+                            }
                         }
-                    }
-                });
-                if (messages.length > 0) break;
-            }
-        }
-
-        if (messages.length === 0) {
-            const mainContent = document.querySelector('main') || document.querySelector('[class*="chat-container"]');
-            if (mainContent) {
-                const clone = mainContent.cloneNode(true);
-
-                // 同样处理主内容中的代码块和LaTeX
-                const codeBlocks = clone.querySelectorAll('pre, code, .hljs, [class*="code-block"]');
-                codeBlocks.forEach(block => {
-                    const placeholder = document.createElement('span');
-                    placeholder.textContent = '[代码块]';
-                    block.parentNode.replaceChild(placeholder, block);
-                });
-
-                const latexSelectors = ['.katex', '.MathJax', '[class*="math"]', '[class*="latex"]'];
-                for (const latexSelector of latexSelectors) {
-                    const latexElements = clone.querySelectorAll(latexSelector);
-                    latexElements.forEach(latexEl => {
-                        const placeholder = document.createElement('span');
-                        placeholder.textContent = '[LaTeX]';
-                        latexEl.parentNode.replaceChild(placeholder, latexEl);
                     });
-                }
-
-                const text = clone.textContent.trim();
-                if (text && text.length > 5) {
-                    messages.push(text);
+                    if (messages.length > 0) break;
                 }
             }
-        }
 
-        return messages.length > 0 ? messages.join('\n\n') : '无法预览对话内容，请手动点击查看';
-    } catch (e) {
-        console.error('获取对话内容失败:', e);
-        return '获取对话内容失败';
+            if (messages.length === 0) {
+                const mainContent = document.querySelector('main') || document.querySelector('[class*="chat-container"]');
+                if (mainContent) {
+                    const clone = mainContent.cloneNode(true);
+
+                    const codeBlocks = clone.querySelectorAll('pre, code, .hljs, [class*="code-block"]');
+                    codeBlocks.forEach(block => {
+                        const placeholder = document.createElement('span');
+                        placeholder.textContent = '[代码块]';
+                        block.parentNode.replaceChild(placeholder, block);
+                    });
+
+                    const latexSelectors = ['.katex', '.MathJax', '[class*="math"]', '[class*="latex"]'];
+                    for (const latexSelector of latexSelectors) {
+                        const latexElements = clone.querySelectorAll(latexSelector);
+                        latexElements.forEach(latexEl => {
+                            const placeholder = document.createElement('span');
+                            placeholder.textContent = '[LaTeX]';
+                            latexEl.parentNode.replaceChild(placeholder, latexEl);
+                        });
+                    }
+
+                    const text = clone.textContent.trim();
+                    if (text && text.length > 5) {
+                        messages.push(text);
+                    }
+                }
+            }
+
+            return messages.length > 0 ? messages.join('\n\n') : '无法预览对话内容，请手动点击查看';
+        } catch (e) {
+            console.error('获取对话内容失败:', e);
+            return '获取对话内容失败';
+        }
     }
+
+function showToast(message, type = 'info') {
+    const toast = document.createElement('div');
+    const colors = {
+        success: '#10b981',
+        error: '#ef4444',
+        info: PRIMARY_COLOR
+    };
+
+    toast.style.cssText = `
+        position: fixed;
+        bottom: 20px;
+        right: 80px;
+        background-color: ${colors[type] || colors.info};
+        color: white;
+        padding: 10px 20px;
+        border-radius: 5px;
+        z-index: 10000;
+        animation: fadeOut 2s forwards;
+        box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    `;
+    toast.textContent = message;
+    document.body.appendChild(toast);
+
+    setTimeout(() => {
+        toast.remove();
+    }, 2000);
 }
 
-    // 显示提示
-    function showToast(message, type = 'info') {
-        const toast = document.createElement('div');
-        const colors = {
-            success: '#10b981',
-            error: '#ef4444',
-            info: PRIMARY_COLOR
-        };
-
-        toast.style.cssText = `
-            position: fixed;
-            bottom: 80px;
-            right: 20px;
-            background-color: ${colors[type] || colors.info};
-            color: white;
-            padding: 10px 20px;
-            border-radius: 5px;
-            z-index: 10000;
-            animation: fadeOut 2s forwards;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.2);
-        `;
-        toast.textContent = message;
-        document.body.appendChild(toast);
-
-        setTimeout(() => {
-            toast.remove();
-        }, 2000);
-    }
-
-// 添加样式
+    // 添加样式
     GM_addStyle(`
         @media (prefers-color-scheme: dark) {
             .dsc-modal-content {
@@ -381,7 +364,6 @@ function getCurrentConversation() {
                 background-color: #1f2937;
                 border: 1px solid #374151;
             }
-            /* 新增：让分类下拉菜单也适配深色主题 */
             .dsc-category-select {
                 background-color: #1f2937;
                 border-color: #4b5563;
@@ -424,7 +406,6 @@ function getCurrentConversation() {
                 background-color: #f3f4f6;
                 border: 1px solid #e5e7eb;
             }
-            /* 新增：让分类下拉菜单也适配浅色主题 */
             .dsc-category-select {
                 background-color: #ffffff;
                 border-color: #d1d5db;
@@ -439,7 +420,6 @@ function getCurrentConversation() {
             }
         }
 
-        /* 添加基础样式，确保在所有情况下都能良好显示 */
         .dsc-category-select {
             padding: 4px 8px;
             border-radius: 4px;
@@ -460,7 +440,6 @@ function getCurrentConversation() {
             border-color: ${PRIMARY_COLOR};
             box-shadow: 0 0 0 2px ${PRIMARY_COLOR}20;
         }
-
 
         .dsc-modal {
             display: none;
@@ -657,15 +636,14 @@ function getCurrentConversation() {
         .dsc-collection-list {
             max-height: 400px;
             overflow-y: auto;
-            overflow-x: hidden !important;  /* 彻底禁用水平滚动条 */
+            overflow-x: hidden !important;
             word-break: break-word;
             white-space: normal;
             width: 100%;
             box-sizing: border-box;
-            padding-right: 8px;  /* 为垂直滚动条留出空间 */
+            padding-right: 8px;
         }
 
-        /* 确保所有子元素不溢出 */
         .dsc-collection-list * {
             max-width: 100%;
             box-sizing: border-box;
@@ -722,7 +700,7 @@ function getCurrentConversation() {
             text-overflow: ellipsis;
             white-space: nowrap;
             flex: 1;
-            min-width: 0;  /* 允许flex项收缩 */
+            min-width: 0;
         }
 
         .dsc-category-select {
@@ -734,7 +712,7 @@ function getCurrentConversation() {
             opacity: 0.7;
             color: inherit;
             cursor: pointer;
-            max-width: 120px;  /* 限制最大宽度 */
+            max-width: 120px;
             width: auto;
             flex-shrink: 0;
             overflow: hidden;
@@ -855,6 +833,148 @@ function getCurrentConversation() {
             70% { opacity: 1; }
             100% { opacity: 0; }
         }
+
+		.dsc-backup-modal {
+            display: none;
+            position: fixed;
+            z-index: 10001;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+        }
+
+        .dsc-backup-content {
+            margin: 15% auto;
+            padding: 25px;
+            border-radius: 8px;
+            width: 90%;
+            max-width: 450px;
+            background-color: var(--bg-color, #ffffff);
+            border-top: 4px solid ${PRIMARY_COLOR};
+            box-shadow: 0 4px 20px rgba(0,0,0,0.2);
+            position: relative;
+            color: var(--text-color, #111827);
+        }
+
+        @media (prefers-color-scheme: dark) {
+            .dsc-backup-content {
+                --bg-color: #1f2937;
+                --text-color: #e5e7eb;
+                border: 1px solid #374151;
+            }
+        }
+
+        .dsc-backup-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+
+        .dsc-backup-header h3 {
+            margin: 0;
+            color: ${PRIMARY_COLOR};
+        }
+
+        .dsc-backup-close {
+            color: #aaa;
+            font-size: 24px;
+            cursor: pointer;
+        }
+
+        .dsc-backup-close:hover {
+            color: ${PRIMARY_COLOR};
+        }
+
+        .dsc-backup-stats {
+            background-color: ${PRIMARY_COLOR}10;
+            padding: 15px;
+            border-radius: 6px;
+            margin-bottom: 20px;
+        }
+
+        .dsc-backup-stats p {
+            margin: 8px 0;
+            font-size: 1.1em;
+        }
+
+        .dsc-backup-stats .warning {
+            color: #ef4444;
+            font-weight: bold;
+        }
+
+        .dsc-backup-buttons {
+            display: flex;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+
+        .dsc-backup-btn {
+            flex: 1;
+            padding: 12px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1em;
+            transition: all 0.2s;
+        }
+
+        .dsc-backup-btn.export {
+            background-color: ${PRIMARY_COLOR};
+            color: white;
+        }
+
+        .dsc-backup-btn.import {
+            background-color: #10b981;
+            color: white;
+        }
+
+        .dsc-backup-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+        }
+
+        .dsc-backup-info {
+            border-top: 1px solid currentColor;
+            padding-top: 15px;
+            margin-top: 15px;
+            opacity: 0.8;
+            font-size: 0.9em;
+        }
+
+        .dsc-backup-info p {
+            margin: 5px 0;
+        }
+
+        .dsc-backup-email {
+            color: ${PRIMARY_COLOR};
+            font-weight: bold;
+        }
+
+        .dsc-backup-checkbox {
+            margin-top: 10px;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            cursor: pointer;
+        }
+
+        .dsc-backup-btn-icon {
+            background-color: #f59e0b;
+        }
+
+        .dsc-item-checkbox {
+            left: 5px !important;
+            z-index: 10;
+        }
+        .dsc-collection-item {
+            padding-left: 30px !important;
+            position: relative;
+        }
+
     `);
 
     // 全局变量
@@ -863,32 +983,36 @@ function getCurrentConversation() {
     let currentSortBy = 'time-desc';
     let currentCategory = 'all';
     let selectedItems = new Set();
+    let isSaving = false; // 添加保存锁
 
-    // 渲染分类（固定6个，支持重命名）
     function renderCategories() {
         try {
             if (!modal) return;
 
-            const categoriesList = modal.querySelector('#dsc-categories-list');
+            if (!categoriesListCache) {
+                categoriesListCache = modal.querySelector('#dsc-categories-list');
+            }
+            const categoriesList = categoriesListCache;
             if (!categoriesList) return;
 
             const allCats = categories.getAll();
             const allCollections = storage.getAll();
 
+            const validCollections = allCollections.filter(({ value }) => !isGhostItem(value));
+
             let html = `
                 <div class="dsc-category-item ${currentCategory === 'all' ? 'active' : ''}" data-category="all">
                     <span>📋 全部</span>
-                    <span class="dsc-category-badge">${allCollections.length}</span>
+                    <span class="dsc-category-badge">${validCollections.length}</span>
                 </div>
                 <div class="dsc-category-item ${currentCategory === 'uncategorized' ? 'active' : ''}" data-category="uncategorized">
-                    <span>📁 默认</span>
-                    <span class="dsc-category-badge">${allCollections.filter(({value}) => !value.category).length}</span>
+                    <span>📁 未分类</span>
+                    <span class="dsc-category-badge">${validCollections.filter(({value}) => !value.category).length}</span>
                 </div>
             `;
 
-            // 渲染固定的6个分类
             allCats.forEach((cat, index) => {
-                const count = allCollections.filter(({value}) => value.category === cat).length;
+                const count = validCollections.filter(({value}) => value.category === cat).length;
                 html += `
                     <div class="dsc-category-item ${currentCategory === cat ? 'active' : ''}" data-category="${cat}" data-category-index="${index}">
                         <span>📁 ${cat}</span>
@@ -900,11 +1024,9 @@ function getCurrentConversation() {
 
             categoriesList.innerHTML = html;
 
-            // 为每个分类项添加点击事件（选择分类）
             const categoryItems = categoriesList.querySelectorAll('.dsc-category-item');
             categoryItems.forEach(item => {
                 item.addEventListener('click', (e) => {
-                    // 如果点击的是重命名按钮，不处理分类选择
                     if (e.target.classList.contains('dsc-category-rename')) {
                         return;
                     }
@@ -918,7 +1040,6 @@ function getCurrentConversation() {
                 });
             });
 
-            // 为每个重命名按钮添加事件
             const renameButtons = categoriesList.querySelectorAll('.dsc-category-rename');
             renameButtons.forEach(btn => {
                 btn.addEventListener('click', (e) => {
@@ -933,7 +1054,6 @@ function getCurrentConversation() {
                     const newName = prompt('请输入新的分类名称：', categoryName);
                     if (newName && newName.trim()) {
                         if (categories.rename(parseInt(categoryIndex), newName)) {
-                            // 如果当前选中的是这个分类，更新currentCategory
                             if (currentCategory === categoryName) {
                                 currentCategory = newName;
                             }
@@ -952,31 +1072,38 @@ function getCurrentConversation() {
         }
     }
 
-    // 渲染收藏列表
     function renderCollections() {
         try {
             if (!modal) return;
 
-            const collectionList = modal.querySelector('#dsc-collection-list');
+            if (!collectionListCache) {
+                collectionListCache = modal.querySelector('#dsc-collection-list');
+            }
+            const collectionList = collectionListCache;
             if (!collectionList) return;
 
             const allCollections = storage.getAll();
 
             if (allCollections.length === 0) {
                 collectionList.innerHTML = '<div class="dsc-empty">暂无收藏的对话</div>';
+                const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
+                if (batchToolbar) {
+                    batchToolbar.style.display = 'none';
+                }
                 return;
             }
 
-            // 筛选
             let filtered = allCollections.filter(({ value }) => {
-                // 分类筛选
+                if (isGhostItem(value)) {
+                    return false;
+                }
+
                 if (currentCategory === 'uncategorized') {
                     if (value.category) return false;
                 } else if (currentCategory !== 'all') {
                     if (value.category !== currentCategory) return false;
                 }
 
-                // 搜索筛选
                 if (currentSearchTerm) {
                     const searchLower = currentSearchTerm.toLowerCase();
                     return (value.title || '').toLowerCase().includes(searchLower) ||
@@ -986,11 +1113,14 @@ function getCurrentConversation() {
                 return true;
             });
 
-            // 排序
             filtered = sortCollections(filtered, currentSortBy);
 
             if (filtered.length === 0) {
                 collectionList.innerHTML = '<div class="dsc-empty">没有找到匹配的收藏</div>';
+                const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
+                if (batchToolbar) {
+                    batchToolbar.style.display = 'none';
+                }
                 return;
             }
 
@@ -1019,7 +1149,7 @@ function getCurrentConversation() {
                         </div>
                         <div class="dsc-collection-preview">${preview}</div>
                         <div class="dsc-collection-meta">
-                            <span>📏 ${length} 字</span>
+                            <span>📏 ${length} 字（不包括代码块 / Latex）</span>
                             <span>📅 ${date}</span>
                         </div>
                         <div class="dsc-actions">
@@ -1032,94 +1162,109 @@ function getCurrentConversation() {
 
             collectionList.innerHTML = html;
 
-            // 为每个收藏项添加事件监听
-            const collectionItems = collectionList.querySelectorAll('.dsc-collection-item');
-            collectionItems.forEach(item => {
-                const key = item.dataset.key;
-                const checkbox = item.querySelector('.dsc-item-checkbox');
+            const newCollectionList = collectionList.cloneNode(false);
+            newCollectionList.innerHTML = collectionList.innerHTML;
+            collectionList.parentNode.replaceChild(newCollectionList, collectionList);
 
-                // 点击复选框
-                checkbox.addEventListener('change', (e) => {
-                    e.stopPropagation();
-                    if (checkbox.checked) {
-                        selectedItems.add(key);
-                        item.classList.add('selected');
-                    } else {
-                        selectedItems.delete(key);
-                        item.classList.remove('selected');
-                    }
-                    updateBatchToolbar();
-                });
+            collectionListCache = newCollectionList;
 
-                // 点击收藏项（除了按钮和复选框）
-                item.addEventListener('click', (e) => {
-                    if (e.target.tagName === 'BUTTON' || e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') {
-                        return;
-                    }
-
-                    checkbox.checked = !checkbox.checked;
-                    const changeEvent = new Event('change', { bubbles: true });
-                    checkbox.dispatchEvent(changeEvent);
-                });
-            });
-
-            // 查看按钮
-            collectionList.querySelectorAll('.view-btn').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                     e.preventDefault();
-
-                    const url = btn.dataset.url;
-                    if (url && url !== window.location.href) {
-                        modal.style.display = 'none';
-                        selectedItems.clear();
-                        window.location.href = url;
-                    } else {
-                        showToast('当前已在对话页面', 'info');
-                    }
-                });
-            });
-
-            // 删除按钮
-            collectionList.querySelectorAll('.delete-btn').forEach(btn => {
-                btn.addEventListener('click', (e) => {
-                    e.stopPropagation();
-                    const key = btn.dataset.key;
-                    if (confirm('确定要从收藏夹中移除这个项目吗？(这不会删除原始对话)')) {
-                        storage.remove(key);
-                        selectedItems.delete(key);
-                        renderCategories();
-                        renderCollections();
-                        showToast('✅ 已从收藏移除', 'success');
-                    }
-                });
-            });
-
-            // 分类选择器
-            collectionList.querySelectorAll('.dsc-category-select').forEach(select => {
-                select.addEventListener('change', (e) => {
-                    e.stopPropagation();
-                    const key = select.dataset.key;
-                    const newCategory = select.value;
-
-                    const collection = storage.getAll().find(c => c.key === key);
-                    if (collection) {
-                        collection.value.category = newCategory;
-                        storage.set(key, collection.value);
-                        renderCategories();
-                        showToast('✅ 分类已更新', 'success');
-                    }
-                });
-            });
+            newCollectionList.addEventListener('change', handleCollectionChange);
+            newCollectionList.addEventListener('click', handleCollectionClick);
 
             updateBatchToolbar();
+
+            if (selectedItems.size === 0) {
+                const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
+                if (batchToolbar) {
+                    batchToolbar.style.display = 'none';
+                }
+            }
 
         } catch (e) {
             console.error('渲染收藏列表失败:', e);
         }
     }
 
-    // 更新批量操作工具栏
+    function handleCollectionChange(e) {
+        if (e.target.classList.contains('dsc-item-checkbox')) {
+            const item = e.target.closest('.dsc-collection-item');
+            const key = item.dataset.key;
+
+            if (e.target.checked) {
+                selectedItems.add(key);
+                item.classList.add('selected');
+            } else {
+                selectedItems.delete(key);
+                item.classList.remove('selected');
+            }
+            updateBatchToolbar();
+        } else if (e.target.classList.contains('dsc-category-select')) {
+            e.stopPropagation();
+            const key = e.target.dataset.key;
+            const newCategory = e.target.value;
+
+            const collection = storage.getAll().find(c => c.key === key);
+            if (collection) {
+                collection.value.category = newCategory;
+                storage.set(key, collection.value);
+                renderCategories();
+                showToast('✅ 分类已更新', 'success');
+            }
+        }
+    }
+
+    function handleCollectionClick(e) {
+        if (e.target.classList.contains('view-btn')) {
+            e.stopPropagation();
+            e.preventDefault();
+
+            const url = e.target.dataset.url;
+            if (url && url !== window.location.href) {
+                modal.style.display = 'none';
+                selectedItems.clear();
+                resetCaches();
+                window.location.href = url;
+            } else {
+                showToast('当前已在对话页面', 'info');
+            }
+        } else if (e.target.classList.contains('delete-btn')) {
+            e.stopPropagation();
+            const key = e.target.dataset.key;
+            if (confirm('确定要从收藏夹中移除这个项目吗？(这不会删除原始对话)')) {
+                storage.remove(key);
+                selectedItems.delete(key);
+                renderCategories();
+                renderCollections();
+
+                if (selectedItems.size === 0) {
+                    const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
+                    if (batchToolbar) {
+                        batchToolbar.style.display = 'none';
+                    }
+
+                    const selectAllCheckbox = modal.querySelector('#dsc-select-all-checkbox');
+                    if (selectAllCheckbox) {
+                        selectAllCheckbox.checked = false;
+                        selectAllCheckbox.indeterminate = false;
+                    }
+                }
+
+                showToast('✅ 已从收藏移除', 'success');
+            }
+        } else if (e.target.closest('.dsc-collection-item') &&
+                 !e.target.classList.contains('dsc-item-checkbox') &&
+                 !e.target.classList.contains('view-btn') &&
+                 !e.target.classList.contains('delete-btn') &&
+                 !e.target.classList.contains('dsc-category-select')) {
+
+            const item = e.target.closest('.dsc-collection-item');
+            const checkbox = item.querySelector('.dsc-item-checkbox');
+            checkbox.checked = !checkbox.checked;
+            const changeEvent = new Event('change', { bubbles: true });
+            checkbox.dispatchEvent(changeEvent);
+        }
+    }
+
     function updateBatchToolbar() {
         try {
             if (!modal) return;
@@ -1127,6 +1272,12 @@ function getCurrentConversation() {
             const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
             const selectAllCheckbox = modal.querySelector('#dsc-select-all-checkbox');
             const selectedCountSpan = modal.querySelector('#dsc-selected-count-batch');
+
+            batchToolbarCache = batchToolbar;
+            selectAllCheckboxCache = selectAllCheckbox;
+            selectedCountSpanCache = selectedCountSpan;
+
+            if (!batchToolbar || !selectedCountSpan) return;
 
             if (selectedItems.size > 0) {
                 batchToolbar.style.display = 'flex';
@@ -1145,7 +1296,6 @@ function getCurrentConversation() {
         }
     }
 
-    // 创建模态框
     function createModal() {
         try {
             const modal = document.createElement('div');
@@ -1160,7 +1310,7 @@ function getCurrentConversation() {
                     <div class="dsc-main-layout">
                         <div class="dsc-categories-panel">
                             <div class="dsc-categories-header">
-                                <h3>📁 分类（固定1+6个）</h3>
+                                <h3>📁 分类（全部+未分类+6个）</h3>
                             </div>
                             <div class="dsc-categories-list" id="dsc-categories-list"></div>
                         </div>
@@ -1200,51 +1350,75 @@ function getCurrentConversation() {
         }
     }
 
-    // 保存当前对话
-    function saveCurrentConversation() {
-        try {
-            const title = document.title.replace(' - DeepSeek', '') || 'DeepSeek对话';
-            const content = getCurrentConversation();
-            const url = window.location.href;
-            const timestamp = new Date().toISOString();
-
-            // 检查是否已存在相同对话
-            const allCollections = storage.getAll();
-            const newHash = hashCode(title + content);
-
-            const existingCollection = allCollections.find(({ value }) => {
-                const existingHash = hashCode(value.title + value.content);
-                return existingHash === newHash;
-            });
-
-            if (existingCollection) {
-                existingCollection.value.timestamp = timestamp;
-                existingCollection.value.url = url;
-                storage.set(existingCollection.key, existingCollection.value);
-                showToast('🔄 已更新现有收藏的时间', 'success');
-            } else {
-                const key = `dsc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-                const conversation = {
-                    title,
-                    content,
-                    url,
-                    timestamp,
-                    category: ''
-                };
-                storage.set(key, conversation);
-                showToast('✅ 对话已添加到收藏', 'success');
-            }
-        } catch (e) {
-            console.error('保存对话失败:', e);
-            showToast('❌ 保存失败', 'error');
-        }
+// 修改 saveCurrentConversation 函数
+function saveCurrentConversation() {
+    // 如果正在保存中，直接返回
+    if (isSaving) {
+        showToast('⏳ 正在保存中，请稍候...', 'info');
+        return;
     }
 
-    // 创建右下角按钮
+    try {
+        isSaving = true; // 锁定
+
+        if (!window.location.href.includes('chat.deepseek.com')) {
+            showToast('⚠️ 请在DeepSeek聊天页面使用', 'error');
+            return;
+        }
+
+        const title = document.title.replace(' - DeepSeek', '') || 'DeepSeek对话';
+        const content = getCurrentConversation();
+        const url = window.location.href;
+        const timestamp = new Date().toISOString();
+
+        const allCollections = storage.getAll();
+        const newHash = hashCode(title + content);
+
+        const existingCollection = allCollections.find(({ value }) => {
+            const existingHash = hashCode(value.title + value.content);
+            return existingHash === newHash;
+        });
+
+        if (existingCollection) {
+            existingCollection.value.timestamp = timestamp;
+            existingCollection.value.url = url;
+            storage.set(existingCollection.key, existingCollection.value);
+            showToast('🔄 已更新现有收藏的时间', 'success');
+        } else {
+            const key = `dsc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+            const conversation = {
+                title,
+                content,
+                url,
+                timestamp,
+                category: ''
+            };
+            storage.set(key, conversation);
+            showToast('✅ 对话已添加到收藏', 'success');
+        }
+    } catch (e) {
+        console.error('保存对话失败:', e);
+        showToast('❌ 保存失败: ' + e.message, 'error');
+    } finally {
+        // 延迟释放锁，防止快速连点
+        setTimeout(() => {
+            isSaving = false;
+        }, 500);
+    }
+}
+
     function createButtonContainer() {
         try {
             const container = document.createElement('div');
             container.className = 'dsc-button-container';
+
+            const backupButton = document.createElement('button');
+            backupButton.className = 'dsc-circle-btn dsc-save-btn';
+            backupButton.innerHTML = '💾';
+            backupButton.title = '备份管理';
+            backupButton.addEventListener('click', () => {
+                showBackupModal();
+            });
 
             const viewButton = document.createElement('button');
             viewButton.className = 'dsc-circle-btn dsc-view-btn';
@@ -1253,6 +1427,7 @@ function getCurrentConversation() {
             viewButton.addEventListener('click', () => {
                 if (modal) {
                     modal.style.display = 'block';
+                    resetCaches();
                     renderCategories();
                     renderCollections();
                 }
@@ -1264,6 +1439,7 @@ function getCurrentConversation() {
             saveButton.title = '收藏当前对话';
             saveButton.addEventListener('click', saveCurrentConversation);
 
+            container.appendChild(backupButton);
             container.appendChild(viewButton);
             container.appendChild(saveButton);
             document.body.appendChild(container);
@@ -1275,7 +1451,246 @@ function getCurrentConversation() {
         }
     }
 
-    // 初始化
+    function createBackupModal() {
+        try {
+            const modal = document.createElement('div');
+            modal.className = 'dsc-backup-modal';
+            modal.id = 'dsc-backup-modal';
+            modal.innerHTML = `
+                <div class="dsc-backup-content">
+                    <div class="dsc-backup-header">
+                        <h3>💾 数据备份（.json格式）</h3>
+                        <span class="dsc-backup-close">&times;</span>
+                    </div>
+
+                    <div class="dsc-backup-stats" id="dsc-backup-stats">
+                        <p>⏰ 距离上一次备份的天数：<span id="dsc-days-since-backup">0</span> </p>
+                        <p>📊 当前共有 <span id="dsc-unbacked-count" class="warning">0</span> 条收藏未备份</p>
+                    </div>
+
+                    <div class="dsc-backup-buttons">
+                        <button class="dsc-backup-btn export" id="dsc-export-btn">📤 导出数据</button>
+                        <button class="dsc-backup-btn import" id="dsc-import-btn">📥 导入数据</button>
+                    </div>
+
+                    <div class="dsc-backup-info">
+                        <p><strong>📌 有同学要问了：为什么要备份呢？</strong></p>
+                        <p>因为：</p>
+                        <p>1. 重装浏览器会清除数据</p>
+                        <p>2. 更换设备时需要迁移数据</p>
+                        <p>3. 而且备份可以防止收藏数据意外丢失哦~</p>
+                    </div>
+                </div>
+            `;
+            document.body.appendChild(modal);
+            return modal;
+        } catch (e) {
+            console.error('创建备份弹窗失败:', e);
+            return null;
+        }
+    }
+
+    function getUnbackedCount() {
+        try {
+            const allCollections = storage.getAll();
+            const lastBackupTime = storage.getLastBackupTime();
+
+            if (lastBackupTime === 0) return allCollections.length;
+
+            return allCollections.filter(({ value }) => {
+                const itemTime = new Date(value.timestamp).getTime();
+                return itemTime > lastBackupTime;
+            }).length;
+        } catch (e) {
+            console.error('获取未备份数量失败:', e);
+            return 0;
+        }
+    }
+
+    function getDaysSinceLastBackup() {
+        try {
+            const lastBackupTime = storage.getLastBackupTime();
+            if (lastBackupTime === 0) return 999;
+
+            const now = Date.now();
+            const diffMs = now - lastBackupTime;
+            const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+            return diffDays;
+        } catch (e) {
+            console.error('计算备份天数失败:', e);
+            return 0;
+        }
+    }
+
+    function updateBackupModal() {
+        try {
+            const backupModal = document.getElementById('dsc-backup-modal');
+            if (!backupModal) return;
+
+            const daysSpan = backupModal.querySelector('#dsc-days-since-backup');
+            const countSpan = backupModal.querySelector('#dsc-unbacked-count');
+
+            const days = getDaysSinceLastBackup();
+            const unbackedCount = getUnbackedCount();
+
+            if (daysSpan) {
+                daysSpan.textContent = days === 999 ? '从未' : days;
+            }
+            if (countSpan) {
+                countSpan.textContent = unbackedCount;
+                countSpan.className = unbackedCount > 0 ? 'warning' : '';
+            }
+        } catch (e) {
+            console.error('更新备份弹窗失败:', e);
+        }
+    }
+
+    function showBackupModal() {
+        try {
+            let backupModal = document.getElementById('dsc-backup-modal');
+            if (!backupModal) {
+                backupModal = createBackupModal();
+            }
+
+            if (!backupModal) return;
+
+            updateBackupModal();
+            backupModal.style.display = 'block';
+
+            const closeBtn = backupModal.querySelector('.dsc-backup-close');
+            if (closeBtn) {
+                closeBtn.onclick = () => {
+                    backupModal.style.display = 'none';
+                };
+            }
+
+            backupModal.onclick = (e) => {
+                if (e.target === backupModal) {
+                    backupModal.style.display = 'none';
+                }
+            };
+
+            const exportBtn = backupModal.querySelector('#dsc-export-btn');
+            if (exportBtn) {
+                exportBtn.onclick = () => {
+                    exportBackup();
+                };
+            }
+
+            const importBtn = backupModal.querySelector('#dsc-import-btn');
+            if (importBtn) {
+                importBtn.onclick = () => {
+                    importBackup();
+                };
+            }
+
+        } catch (e) {
+            console.error('显示备份弹窗失败:', e);
+        }
+    }
+
+    function exportBackup() {
+        try {
+            const allCollections = storage.getAll();
+            const cats = categories.getAll();
+
+            const backupData = {
+                version: '1.1.0',
+                exportTime: Date.now(),
+                categories: cats,
+                collections: allCollections.map(item => ({
+                    key: item.key,
+                    ...item.value
+                }))
+            };
+
+            const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = `deepseek-backup-${new Date().toISOString().split('T')[0]}.json`;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+
+            storage.setLastBackupTime(Date.now());
+            updateBackupModal();
+            showToast('✅ 备份导出成功', 'success');
+
+            const backupModal = document.getElementById('dsc-backup-modal');
+            if (backupModal) {
+                backupModal.style.display = 'none';
+            }
+
+        } catch (e) {
+            console.error('导出备份失败:', e);
+            showToast('❌ 导出失败', 'error');
+        }
+    }
+
+    function importBackup() {
+        try {
+            const input = document.createElement('input');
+            input.type = 'file';
+            input.accept = '.json';
+
+            input.onchange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (e) => {
+                    try {
+                        const backupData = JSON.parse(e.target.result);
+
+                        if (!backupData.collections || !Array.isArray(backupData.collections)) {
+                            throw new Error('无效的备份文件格式');
+                        }
+
+                        if (!confirm(`确定要导入 ${backupData.collections.length} 条收藏吗？现有数据将会被合并。`)) {
+                            return;
+                        }
+
+                        backupData.collections.forEach(item => {
+                            const key = item.key || `dsc_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+                            const { key: _, ...value } = item;
+                            storage.set(key, value);
+                        });
+
+                        if (backupData.categories && Array.isArray(backupData.categories) && backupData.categories.length === 6) {
+                            categories.save(backupData.categories);
+                        }
+
+                        storage.setLastBackupTime(Date.now());
+
+                        renderCategories();
+                        renderCollections();
+                        updateBackupModal();
+
+                        showToast('✅ 导入成功', 'success');
+
+                        const backupModal = document.getElementById('dsc-backup-modal');
+                        if (backupModal) {
+                            backupModal.style.display = 'none';
+                        }
+
+                    } catch (error) {
+                        console.error('解析备份文件失败:', error);
+                        showToast('❌ 备份文件格式错误', 'error');
+                    }
+                };
+                reader.readAsText(file);
+            };
+
+            input.click();
+
+        } catch (e) {
+            console.error('导入备份失败:', e);
+            showToast('❌ 导入失败', 'error');
+        }
+    }
+
     function init() {
         try {
             console.log('初始化脚本...');
@@ -1286,14 +1701,14 @@ function getCurrentConversation() {
                 return;
             }
 
-            // 初始化分类（确保有6个）
             categories.getAll();
+            createBackupModal();
 
-            // 模态框关闭事件
             const closeBtn = modal.querySelector('.dsc-close');
             if (closeBtn) {
                 closeBtn.addEventListener('click', () => {
                     modal.style.display = 'none';
+                    resetCaches();
                     selectedItems.clear();
                 });
             }
@@ -1301,11 +1716,11 @@ function getCurrentConversation() {
             modal.addEventListener('click', (e) => {
                 if (e.target === modal) {
                     modal.style.display = 'none';
+                    resetCaches();
                     selectedItems.clear();
                 }
             });
 
-            // 搜索功能（带防抖）
             const searchInput = modal.querySelector('.dsc-search');
             let searchTimeout;
             if (searchInput) {
@@ -1314,11 +1729,10 @@ function getCurrentConversation() {
                     searchTimeout = setTimeout(() => {
                         currentSearchTerm = e.target.value;
                         renderCollections();
-                    }, 300);
+                    }, 500);
                 });
             }
 
-            // 排序功能
             const sortSelect = modal.querySelector('#dsc-sort-select');
             if (sortSelect) {
                 sortSelect.addEventListener('change', (e) => {
@@ -1327,7 +1741,6 @@ function getCurrentConversation() {
                 });
             }
 
-            // 全选复选框
             const selectAllCheckbox = modal.querySelector('#dsc-select-all-checkbox');
             if (selectAllCheckbox) {
                 selectAllCheckbox.addEventListener('change', (e) => {
@@ -1349,7 +1762,6 @@ function getCurrentConversation() {
                 });
             }
 
-            // 批量删除
             const batchDeleteBtn = modal.querySelector('#dsc-batch-delete-btn');
             if (batchDeleteBtn) {
                 batchDeleteBtn.addEventListener('click', () => {
@@ -1367,17 +1779,39 @@ function getCurrentConversation() {
                         selectedItems.clear();
                         renderCategories();
                         renderCollections();
+
+                        const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
+                        if (batchToolbar) {
+                            batchToolbar.style.display = 'none';
+                        }
+
+                        const selectAllCheckbox = modal.querySelector('#dsc-select-all-checkbox');
+                        if (selectAllCheckbox) {
+                            selectAllCheckbox.checked = false;
+                            selectAllCheckbox.indeterminate = false;
+                        }
+
                         showToast('✅ 删除成功', 'success');
                     }
                 });
             }
 
-            // 取消选择
             const cancelSelectBtn = modal.querySelector('#dsc-cancel-select-btn');
             if (cancelSelectBtn) {
                 cancelSelectBtn.addEventListener('click', () => {
                     selectedItems.clear();
                     renderCollections();
+
+                    const batchToolbar = modal.querySelector('#dsc-batch-toolbar');
+                    if (batchToolbar) {
+                        batchToolbar.style.display = 'none';
+                    }
+
+                    const selectAllCheckbox = modal.querySelector('#dsc-select-all-checkbox');
+                    if (selectAllCheckbox) {
+                        selectAllCheckbox.checked = false;
+                        selectAllCheckbox.indeterminate = false;
+                    }
                 });
             }
 
@@ -1389,7 +1823,6 @@ function getCurrentConversation() {
         }
     }
 
-    // 等待DOM加载完成后初始化
     if (document.readyState === 'loading') {
         document.addEventListener('DOMContentLoaded', init);
     } else {
